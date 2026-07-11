@@ -1,0 +1,16 @@
+<!-- Copy ban-library-account.cmd to the Windows agent active-response/bin folder. -->
+<command>
+  <name>ban-library-account</name>
+  <executable>ban-library-account.cmd</executable>
+  <timeout_allowed>no</timeout_allowed>
+</command>
+
+<active-response>
+  <disabled>no</disabled>
+  <command>ban-library-account</command>
+  <!-- local runs on the same agent that reported the honeypot download. -->
+  <location>local</location>
+  <rules_id>100500</rules_id>
+  <rules_group>northstar_honeypot,</rules_group>
+  <level>12</level>
+</active-response>

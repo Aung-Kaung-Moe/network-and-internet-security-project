@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Northstar Library</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#/">
+        <span class="brand-mark">NL</span>
+        <span>
+          <strong>Northstar Library</strong>
+          <small>Member borrowing portal</small>
+        </span>
+      </a>
+      <nav class="nav-actions">
+        <a href="#/" data-link="home">Catalog</a>
+        <a href="#/account" data-link="account">My Books</a>
+        <button class="ghost-button" id="authButton" type="button">Login</button>
+      </nav>
+    </header>
+
+    <main id="app" class="app-shell"></main>
+
+    <template id="loadingTemplate">
+      <section class="loading-panel">
+        <div class="spinner"></div>
+        <p>Loading library records...</p>
+      </section>
+    </template>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+<!-- Copy this group into the Wazuh manager local_rules.xml. -->
+<group name="northstar_honeypot,">
+  <rule id="100500" level="12">
+    <if_sid>86600</if_sid>
+    <field name="honeypot_program">northstar-library-honeypot</field>
+    <field name="event_type">honeypot_file_download</field>
+    <description>Northstar honeypot bait file downloaded by $(attacker_username)</description>
+    <group>honeypot,credential_access,</group>
+  </rule>
+</group>

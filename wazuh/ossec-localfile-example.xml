@@ -1,0 +1,5 @@
+<!-- Add this localfile block to the Wazuh agent/manager ossec.conf that can read the project logs. -->
+<localfile>
+  <log_format>json</log_format>
+  <location>C:\Users\M S I\Desktop\internet-security-project\logs\wazuh-honeypot-alerts.jsonl</location>
+</localfile>

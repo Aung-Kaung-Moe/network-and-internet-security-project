@@ -1,0 +1,17 @@
+{
+  "name": "library-honeypot",
+  "version": "1.0.0",
+  "description": "Library management honeypot foundation with JWT authentication.",
+  "main": "backend/app.py",
+  "scripts": {
+    "start": "python backend/run_servers.py",
+    "dev": "python backend/run_servers.py"
+  },
+  "keywords": [
+    "library",
+    "honeypot",
+    "jwt"
+  ],
+  "author": "",
+  "license": "MIT"
+}
