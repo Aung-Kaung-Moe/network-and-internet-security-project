@@ -23,11 +23,17 @@ PORT = int(os.environ.get("PORT", "3000"))
 HONEYPOT_PORT = int(os.environ.get("HONEYPOT_PORT", "4000"))
 HONEYPOT_ORIGIN = os.environ.get("HONEYPOT_ORIGIN", f"http://localhost:{HONEYPOT_PORT}")
 REAL_ORIGIN = os.environ.get("REAL_ORIGIN", f"http://localhost:{PORT}")
+REAL_LOGOUT_URL = f"{REAL_ORIGIN}/?logout=1"
 JWT_SECRET = os.environ.get("JWT_SECRET", "book")
 JWT_COOKIE_NAME = "library_jwt"
 HONEYPOT_TICKET_COOKIE = "honeypot_ticket"
 ATTACKER_USERNAME = "attacker"
 ATTACKER_PASSWORD = "password123"
+WEBADMIN_USERNAME = "webadmin"
+WEBADMIN_PASSWORD = "webadmin"
+WEBADMIN_USER_ID = "decoy-webadmin-account"
+LOGIN_BRUTEFORCE_ATTEMPTS = 5
+LOGIN_BRUTEFORCE_WINDOW_SECONDS = 60
 FINE_PER_OVERDUE_DAY = 500
 LOAN_DAYS = 14
 HONEYPOT_TICKET_MINUTES = 10
@@ -250,6 +256,15 @@ def init_db():
               source_event TEXT,
               banned_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS login_attempts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT NOT NULL,
+              ip TEXT NOT NULL,
+              username TEXT NOT NULL,
+              password TEXT NOT NULL,
+              user_agent TEXT NOT NULL
+            );
             """
         )
         ensure_column(db, "users", "decoy_password", "TEXT")
@@ -278,6 +293,22 @@ def init_db():
                 "Aye Chan",
                 password_hash(ATTACKER_USERNAME, ATTACKER_PASSWORD),
                 ATTACKER_PASSWORD,
+                iso(utcnow()),
+            ),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO users (
+              id, username, full_name, role, password_hash, decoy_password, created_at
+            )
+            VALUES (?, ?, ?, 'user', ?, ?, ?)
+            """,
+            (
+                WEBADMIN_USER_ID,
+                WEBADMIN_USERNAME,
+                "Web Admin",
+                password_hash(WEBADMIN_USERNAME, WEBADMIN_PASSWORD),
+                WEBADMIN_PASSWORD,
                 iso(utcnow()),
             ),
         )
@@ -392,6 +423,19 @@ def create_token(user):
     )
 
 
+def create_role_token(user, role, username=None):
+    now = int(utcnow().timestamp())
+    return sign_jwt(
+        {
+            "sub": user["id"],
+            "username": username or user["username"],
+            "role": role,
+            "iat": now,
+            "exp": now + 3600,
+        }
+    )
+
+
 def cookie_header(token, max_age=3600):
     return f"{JWT_COOKIE_NAME}={token}; Path=/; SameSite=Lax; Max-Age={max_age}"
 
@@ -434,7 +478,11 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
-        for key, value in (extra_headers or {}).items():
+        if isinstance(extra_headers, dict):
+            header_items = extra_headers.items()
+        else:
+            header_items = extra_headers or []
+        for key, value in header_items:
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
@@ -442,6 +490,20 @@ class AppHandler(BaseHTTPRequestHandler):
     def redirect_home(self):
         self.send_response(302)
         self.send_header("Location", REAL_ORIGIN)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def logout_redirect(self):
+        expired = [
+            "library_jwt=; Path=/; SameSite=Lax; Max-Age=0",
+            "honeypot_ticket=; Path=/; SameSite=Lax; Max-Age=0",
+            "library_jwt=; Domain=localhost; Path=/; SameSite=Lax; Max-Age=0",
+            "honeypot_ticket=; Domain=localhost; Path=/; SameSite=Lax; Max-Age=0",
+        ]
+        self.send_response(302)
+        self.send_header("Location", REAL_LOGOUT_URL)
+        for cookie in expired:
+            self.send_header("Set-Cookie", cookie)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
@@ -490,6 +552,58 @@ class AppHandler(BaseHTTPRequestHandler):
         }
         with (LOG_DIR / "wazuh-honeypot-alerts.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+    def record_failed_login_attempt(self, username, password):
+        now = utcnow()
+        cutoff = now - dt.timedelta(seconds=LOGIN_BRUTEFORCE_WINDOW_SECONDS)
+        srcip = self.client_address[0]
+        with connect_db() as db:
+            db.execute(
+                """
+                INSERT INTO login_attempts (created_at, ip, username, password, user_agent)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (iso(now), srcip, username, password, self.headers.get("User-Agent", "")),
+            )
+            db.execute(
+                "DELETE FROM login_attempts WHERE created_at < ?",
+                (iso(now - dt.timedelta(days=1)),),
+            )
+            rows = db.execute(
+                """
+                SELECT created_at, username, password, user_agent
+                FROM login_attempts
+                WHERE ip = ? AND created_at >= ?
+                ORDER BY created_at ASC
+                """,
+                (srcip, iso(cutoff)),
+            ).fetchall()
+
+        if len(rows) == LOGIN_BRUTEFORCE_ATTEMPTS:
+            attempted_credentials = [
+                {
+                    "username": row["username"],
+                    "password": row["password"],
+                    "at": row["created_at"],
+                }
+                for row in rows
+            ]
+            self.write_wazuh_alert(
+                "login_bruteforce_detected",
+                {
+                    "severity": "medium",
+                    "action": "review",
+                    "owner_action": "soc_review",
+                    "srcip": srcip,
+                    "window_seconds": LOGIN_BRUTEFORCE_WINDOW_SECONDS,
+                    "attempt_count": len(rows),
+                    "attempted_credentials": attempted_credentials,
+                    "last_attempt_username": username,
+                    "last_attempt_password": password,
+                    "url": self.path,
+                    "recommendation": "review_credentials_no_auto_ban",
+                },
+            )
 
     def cookie_value(self, name):
         cookies = self.headers.get("Cookie", "")
@@ -791,6 +905,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.api_register()
             elif self.command == "POST" and route == "/api/login":
                 self.api_login()
+            elif self.command == "GET" and route == "/api/logout":
+                self.logout_redirect()
             elif self.command == "GET" and route == "/api/me":
                 self.api_me()
             elif self.command == "POST" and route == "/api/honeypot/redirect":
@@ -865,7 +981,54 @@ class AppHandler(BaseHTTPRequestHandler):
             user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
             if user and account_is_banned(db, username):
                 raise ApiError("This account has been banned.", 403)
+
+        if username == WEBADMIN_USERNAME and password == WEBADMIN_PASSWORD:
+            with connect_db() as db:
+                user = db.execute("SELECT * FROM users WHERE username = ?", (WEBADMIN_USERNAME,)).fetchone()
+            if not user:
+                raise ApiError("Admin account is unavailable.", 503)
+            token = create_role_token(user, "admin", WEBADMIN_USERNAME)
+            payload = {
+                "sub": user["id"],
+                "username": WEBADMIN_USERNAME,
+                "role": "admin",
+            }
+            redirect_url, ticket = self.create_honeypot_redirect_url(user, payload)
+            self.log_security(
+                "webadmin_decoy_login",
+                {
+                    "username": username,
+                    "target": redirect_url,
+                    "srcip": self.client_address[0],
+                },
+            )
+            self.write_wazuh_alert(
+                "webadmin_decoy_login",
+                {
+                    "severity": "high",
+                    "action": "review",
+                    "owner_action": "soc_review",
+                    "srcip": self.client_address[0],
+                    "attempted_username": username,
+                    "attempted_password": password,
+                    "token_role": "admin",
+                    "target": redirect_url,
+                    "url": self.path,
+                    "recommendation": "review_webadmin_decoy_login_no_auto_ban",
+                },
+            )
+            self.send_json(
+                200,
+                {"user": public_user(user, payload), "token": token, "redirect": redirect_url},
+                [
+                    ("Set-Cookie", cookie_header(token)),
+                    ("Set-Cookie", honeypot_ticket_cookie(ticket)),
+                ],
+            )
+            return
+
         if not user or user["password_hash"] != password_hash(username, password):
+            self.record_failed_login_attempt(username, password)
             raise ApiError("Invalid username or password.", 401)
         token = create_token(user)
         self.send_json(200, {"user": public_user(user), "token": token}, {"Set-Cookie": cookie_header(token)})
@@ -980,6 +1143,8 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def api_admin_download(self, file_id):
         user, payload, ticket = self.require_honeypot_ticket()
+        attacker_username = str(payload.get("username") or "").strip().lower()
+        is_webadmin_decoy = attacker_username == WEBADMIN_USERNAME
         self.log_security(
             "honeypot_file_download",
             {
@@ -990,33 +1155,36 @@ class AppHandler(BaseHTTPRequestHandler):
                 "ticket": ticket,
             },
         )
+        event_type = "webadmin_file_download" if is_webadmin_decoy else "honeypot_file_download"
+        recommendation = "review_webadmin_download_no_auto_ban" if is_webadmin_decoy else "ban_account"
         self.write_wazuh_alert(
-            "honeypot_file_download",
+            event_type,
             {
                 "file": file_id,
-                "attacker_username": payload.get("username"),
-                "account_to_ban": payload.get("username"),
+                "attacker_username": attacker_username,
+                **({} if is_webadmin_decoy else {"account_to_ban": attacker_username}),
                 "user_id": user["id"],
                 "token_role": payload.get("role"),
                 "client_ip": self.client_address[0],
                 "url": self.path,
-                "recommendation": "ban_account",
+                "recommendation": recommendation,
             },
         )
-        with connect_db() as db:
-            ban_account(
-                db,
-                payload.get("username"),
-                json.dumps(
-                    {
-                        "source": "app:honeytoken-download",
-                        "file": file_id,
-                        "ticket": ticket,
-                        "url": self.path,
-                    },
-                    separators=(",", ":"),
-                ),
-            )
+        if not is_webadmin_decoy:
+            with connect_db() as db:
+                ban_account(
+                    db,
+                    attacker_username,
+                    json.dumps(
+                        {
+                            "source": "app:honeytoken-download",
+                            "file": file_id,
+                            "ticket": ticket,
+                            "url": self.path,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
 
         if file_id == "credentials":
             rows = self.credential_rows(user, payload)
@@ -1195,13 +1363,19 @@ class HoneypotHandler(AppHandler):
                 payload = self.verify_jwt(token)
                 with connect_db() as db:
                     user = db.execute("SELECT * FROM users WHERE id = ?", (payload.get("sub"),)).fetchone()
-                    if user and not account_is_banned(db, user["username"]):
+                    payload_username = str(payload.get("username") or "").lower()
+                    if (
+                        user
+                        and not account_is_banned(db, user["username"])
+                        and user["username"] != WEBADMIN_USERNAME
+                        and payload_username != WEBADMIN_USERNAME
+                    ):
                         normal_token = create_token(user)
             except ApiError:
                 normal_token = ""
 
         self.send_response(302)
-        self.send_header("Location", REAL_ORIGIN)
+        self.send_header("Location", REAL_ORIGIN if normal_token else REAL_LOGOUT_URL)
         self.send_header("Set-Cookie", honeypot_ticket_cookie("", 0))
         if normal_token:
             self.send_header("Set-Cookie", cookie_header(normal_token))
@@ -1261,7 +1435,9 @@ class HoneypotHandler(AppHandler):
     def handle_api(self):
         route = urlparse(self.path).path
         try:
-            if self.command == "GET" and route == "/api/admin/files":
+            if self.command == "GET" and route == "/api/logout":
+                self.logout_redirect()
+            elif self.command == "GET" and route == "/api/admin/files":
                 self.api_admin_files()
             elif self.command == "GET" and route.startswith("/api/admin/download/"):
                 self.api_admin_download(route.rsplit("/", 1)[-1])

@@ -7,4 +7,28 @@
     <description>Northstar honeypot bait file downloaded by $(attacker_username)</description>
     <group>honeypot,credential_access,</group>
   </rule>
+
+  <rule id="100501" level="8">
+    <if_sid>86600</if_sid>
+    <field name="honeypot_program">northstar-library-honeypot</field>
+    <field name="event_type">login_bruteforce_detected</field>
+    <description>Northstar login brute-force pattern from $(srcip) with attempted credentials</description>
+    <group>honeypot,authentication_failed,bruteforce,</group>
+  </rule>
+
+  <rule id="100502" level="10">
+    <if_sid>86600</if_sid>
+    <field name="honeypot_program">northstar-library-honeypot</field>
+    <field name="event_type">webadmin_decoy_login</field>
+    <description>Northstar webadmin decoy credentials used from $(srcip)</description>
+    <group>honeypot,credential_access,decoy_login,</group>
+  </rule>
+
+  <rule id="100503" level="10">
+    <if_sid>86600</if_sid>
+    <field name="honeypot_program">northstar-library-honeypot</field>
+    <field name="event_type">webadmin_file_download</field>
+    <description>Northstar webadmin decoy account downloaded bait file $(file)</description>
+    <group>honeypot,credential_access,decoy_download,</group>
+  </rule>
 </group>

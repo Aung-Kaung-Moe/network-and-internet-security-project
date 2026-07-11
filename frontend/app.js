@@ -1,6 +1,11 @@
 const app = document.querySelector("#app");
 const authButton = document.querySelector("#authButton");
 
+function clearStoredAuth() {
+  localStorage.removeItem("libraryToken");
+  localStorage.removeItem("libraryUser");
+}
+
 function cookieToken() {
   return document.cookie
     .split(";")
@@ -9,12 +14,20 @@ function cookieToken() {
     ?.slice("library_jwt=".length) || "";
 }
 
+const logoutRequested = location.pathname === "/logout" || new URL(location.href).searchParams.has("logout");
+if (logoutRequested) {
+  clearStoredAuth();
+  document.cookie = "library_jwt=; Path=/; SameSite=Lax; Max-Age=0";
+  document.cookie = "honeypot_ticket=; Path=/; SameSite=Lax; Max-Age=0";
+  history.replaceState(null, "", "/");
+}
+
 const state = {
   books: [],
   category: "All",
   search: "",
-  token: cookieToken() || localStorage.getItem("libraryToken") || "",
-  user: JSON.parse(localStorage.getItem("libraryUser") || "null")
+  token: logoutRequested ? "" : cookieToken() || localStorage.getItem("libraryToken") || "",
+  user: logoutRequested ? null : JSON.parse(localStorage.getItem("libraryUser") || "null")
 };
 
 function setToken(token, user) {
@@ -25,8 +38,7 @@ function setToken(token, user) {
     localStorage.setItem("libraryUser", JSON.stringify(user));
     document.cookie = `library_jwt=${token}; Path=/; SameSite=Lax; Max-Age=3600`;
   } else {
-    localStorage.removeItem("libraryToken");
-    localStorage.removeItem("libraryUser");
+    clearStoredAuth();
     document.cookie = "library_jwt=; Path=/; SameSite=Lax; Max-Age=0";
   }
   syncNav();
@@ -43,7 +55,7 @@ function clearAuthCookies() {
 function logoutToRealSite() {
   setToken("", null);
   clearAuthCookies();
-  location.href = "http://localhost:3000";
+  location.href = isHoneypotPort() ? "/api/logout" : "http://localhost:3000/api/logout";
 }
 
 function syncNav() {
@@ -340,6 +352,10 @@ function renderAuth(mode) {
         body: JSON.stringify(Object.fromEntries(form.entries()))
       });
       setToken(result.token, result.user);
+      if (result.redirect) {
+        location.href = result.redirect;
+        return;
+      }
       location.hash = "#/account";
     } catch (error) {
       message.textContent = error.message;
