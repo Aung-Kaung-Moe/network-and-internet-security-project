@@ -31,4 +31,36 @@
     <description>Northstar webadmin decoy account downloaded bait file $(file)</description>
     <group>honeypot,credential_access,decoy_download,</group>
   </rule>
+
+  <rule id="100504" level="8">
+    <if_sid>86600</if_sid>
+    <field name="honeypot_program">northstar-library-honeypot</field>
+    <field name="event_type">idor_probe_detected</field>
+    <description>Northstar possible IDOR probe against $(target_object)</description>
+    <group>honeypot,web,idor,access_control,</group>
+  </rule>
+
+  <rule id="100505" level="8">
+    <if_sid>86600</if_sid>
+    <field name="honeypot_program">northstar-library-honeypot</field>
+    <field name="event_type">sql_injection_probe</field>
+    <description>Northstar SQL injection probe in $(source)</description>
+    <group>honeypot,web,sql_injection,input_validation,</group>
+  </rule>
+
+  <rule id="100506" level="7">
+    <if_sid>86600</if_sid>
+    <field name="honeypot_program">northstar-library-honeypot</field>
+    <field name="event_type">scanner_user_agent</field>
+    <description>Northstar scanner User-Agent detected from $(srcip)</description>
+    <group>honeypot,recon,scanner,user_agent,</group>
+  </rule>
+
+  <rule id="100507" level="8">
+    <if_sid>86600</if_sid>
+    <field name="honeypot_program">northstar-library-honeypot</field>
+    <field name="event_type">path_bruteforce</field>
+    <description>Northstar unrelated path brute-force from $(srcip)</description>
+    <group>honeypot,recon,path_bruteforce,</group>
+  </rule>
 </group>

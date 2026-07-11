@@ -10,6 +10,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 import uuid
@@ -34,9 +35,80 @@ WEBADMIN_PASSWORD = "webadmin"
 WEBADMIN_USER_ID = "decoy-webadmin-account"
 LOGIN_BRUTEFORCE_ATTEMPTS = 5
 LOGIN_BRUTEFORCE_WINDOW_SECONDS = 60
+PATH_BRUTEFORCE_ATTEMPTS = 3
+PATH_BRUTEFORCE_WINDOW_SECONDS = 60
 FINE_PER_OVERDUE_DAY = 500
 LOAN_DAYS = 14
 HONEYPOT_TICKET_MINUTES = 10
+SCANNER_USER_AGENT_KEYWORDS = [
+    "sqlmap",
+    "nikto",
+    "nmap",
+    "masscan",
+    "gobuster",
+    "ffuf",
+    "wfuzz",
+    "dirsearch",
+    "wpscan",
+    "zgrab",
+    "acunetix",
+    "nessus",
+    "burpsuite",
+]
+KNOWN_STATIC_PATHS = {
+    "/",
+    "/index.html",
+    "/app.js",
+    "/styles.css",
+    "/favicon.ico",
+    "/webadmin",
+    "/admin",
+    "/dashboard",
+    "/logout",
+}
+KNOWN_API_EXACT_PATHS = {
+    "/api/books",
+    "/api/register",
+    "/api/login",
+    "/api/logout",
+    "/api/me",
+    "/api/honeypot/redirect",
+    "/api/borrow",
+    "/api/return",
+    "/api/admin/files",
+}
+SQLI_PATTERNS = [
+    ("union_select", re.compile(r"\bunion\b.{0,40}\bselect\b", re.IGNORECASE)),
+    ("boolean_or", re.compile(r"(['\"]?\s*\bor\b\s+['\"]?\w+['\"]?\s*=\s*['\"]?\w+)", re.IGNORECASE)),
+    ("boolean_and", re.compile(r"(['\"]?\s*\band\b\s+['\"]?\w+['\"]?\s*=\s*['\"]?\w+)", re.IGNORECASE)),
+    ("tautology", re.compile(r"\b\d+\s*=\s*\d+\b", re.IGNORECASE)),
+    ("sql_comment", re.compile(r"(--|#|/\*|\*/)", re.IGNORECASE)),
+    ("stacked_query", re.compile(r";\s*(select|insert|update|delete|drop|alter|create|exec)\b", re.IGNORECASE)),
+    ("time_delay", re.compile(r"\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(", re.IGNORECASE)),
+    ("schema_probe", re.compile(r"\b(information_schema|sqlite_master|pg_catalog|sysobjects)\b", re.IGNORECASE)),
+    ("file_or_command", re.compile(r"\b(load_file|into\s+outfile|xp_cmdshell)\b", re.IGNORECASE)),
+]
+AUTH_SQLI_PATTERNS = [
+    ("auth_single_quote", re.compile(r"'")),
+    ("auth_double_quote", re.compile(r'"')),
+    ("auth_backslash", re.compile(r"\\")),
+    ("auth_tautology", re.compile(r"\b\d+\s*=\s*\d+\b", re.IGNORECASE)),
+    (
+        "auth_sql_keyword",
+        re.compile(
+            r"\b(select|union|or|and|insert|update|delete|drop|alter|create|from|where|sleep|benchmark|information_schema|sqlite_master)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+AUTH_SQLI_FIELDS = {"username", "password"}
+IDOR_ROUTE_PATTERNS = [
+    re.compile(r"^/api/users/([^/]+)$", re.IGNORECASE),
+    re.compile(r"^/api/users/([^/]+)/loans$", re.IGNORECASE),
+    re.compile(r"^/api/users/([^/]+)/borrowed-books$", re.IGNORECASE),
+    re.compile(r"^/api/loans/([^/]+)$", re.IGNORECASE),
+    re.compile(r"^/api/accounts/([^/]+)$", re.IGNORECASE),
+]
 
 
 SEED_BOOKS = [
@@ -265,6 +337,15 @@ def init_db():
               password TEXT NOT NULL,
               user_agent TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS path_probe_attempts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT NOT NULL,
+              ip TEXT NOT NULL,
+              method TEXT NOT NULL,
+              path TEXT NOT NULL,
+              user_agent TEXT NOT NULL
+            );
             """
         )
         ensure_column(db, "users", "decoy_password", "TEXT")
@@ -458,12 +539,14 @@ class AppHandler(BaseHTTPRequestHandler):
     server_version = "NorthstarLibrary/1.0"
 
     def do_GET(self):
+        self.inspect_request()
         if self.path.startswith("/api/"):
             self.handle_api()
         else:
             self.serve_static()
 
     def do_POST(self):
+        self.inspect_request()
         if self.path.startswith("/api/"):
             self.handle_api()
         else:
@@ -553,6 +636,122 @@ class AppHandler(BaseHTTPRequestHandler):
         with (LOG_DIR / "wazuh-honeypot-alerts.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, separators=(",", ":")) + "\n")
 
+    def inspect_request(self):
+        self.detect_scanner_user_agent()
+        path = unquote(urlparse(self.path).path)
+        if not self.is_known_application_path(path):
+            self.record_unrelated_path_attempt(path)
+
+    def detect_scanner_user_agent(self):
+        user_agent = self.headers.get("User-Agent", "")
+        lowered = user_agent.lower()
+        matches = [keyword for keyword in SCANNER_USER_AGENT_KEYWORDS if keyword in lowered]
+        if not matches:
+            return False
+
+        self.log_security(
+            "scanner_user_agent",
+            {
+                "userAgent": user_agent,
+                "matchedKeywords": matches,
+            },
+        )
+        self.write_wazuh_alert(
+            "scanner_user_agent",
+            {
+                "severity": "medium",
+                "action": "review",
+                "owner_action": "soc_review",
+                "srcip": self.client_address[0],
+                "method": self.command,
+                "url": self.path,
+                "user_agent": user_agent,
+                "matched_keywords": matches,
+                "recommendation": "review_scanner_user_agent_no_auto_ban",
+            },
+        )
+        return True
+
+    def is_known_application_path(self, path):
+        if path in KNOWN_STATIC_PATHS or path in KNOWN_API_EXACT_PATHS:
+            return True
+        if path.startswith("/assets/"):
+            return True
+        if path.startswith("/api/books/"):
+            return True
+        if path.startswith("/api/admin/download/"):
+            return True
+        if any(pattern.match(path) for pattern in IDOR_ROUTE_PATTERNS):
+            return True
+
+        relative = "index.html" if path == "/" else path.lstrip("/")
+        file_path = (FRONTEND_DIR / relative).resolve()
+        if FRONTEND_DIR.resolve() in file_path.parents or file_path == FRONTEND_DIR.resolve():
+            if file_path.exists() and file_path.is_file():
+                return True
+        return False
+
+    def record_unrelated_path_attempt(self, path):
+        now = utcnow()
+        cutoff = now - dt.timedelta(seconds=PATH_BRUTEFORCE_WINDOW_SECONDS)
+        srcip = self.client_address[0]
+        user_agent = self.headers.get("User-Agent", "")
+        with connect_db() as db:
+            db.execute(
+                """
+                INSERT INTO path_probe_attempts (created_at, ip, method, path, user_agent)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (iso(now), srcip, self.command, path, user_agent),
+            )
+            db.execute(
+                "DELETE FROM path_probe_attempts WHERE created_at < ?",
+                (iso(now - dt.timedelta(days=1)),),
+            )
+            rows = db.execute(
+                """
+                SELECT created_at, method, path, user_agent
+                FROM path_probe_attempts
+                WHERE ip = ? AND created_at >= ?
+                ORDER BY created_at ASC
+                """,
+                (srcip, iso(cutoff)),
+            ).fetchall()
+
+        if len(rows) == PATH_BRUTEFORCE_ATTEMPTS:
+            attempted_paths = [
+                {
+                    "method": row["method"],
+                    "path": row["path"],
+                    "at": row["created_at"],
+                }
+                for row in rows
+            ]
+            self.log_security(
+                "path_bruteforce",
+                {
+                    "attemptedPaths": attempted_paths,
+                    "windowSeconds": PATH_BRUTEFORCE_WINDOW_SECONDS,
+                    "attemptCount": len(rows),
+                },
+            )
+            self.write_wazuh_alert(
+                "path_bruteforce",
+                {
+                    "severity": "medium",
+                    "action": "review",
+                    "owner_action": "soc_review",
+                    "srcip": srcip,
+                    "window_seconds": PATH_BRUTEFORCE_WINDOW_SECONDS,
+                    "attempt_count": len(rows),
+                    "attempted_paths": attempted_paths,
+                    "last_path": path,
+                    "user_agent": user_agent,
+                    "recommendation": "review_path_bruteforce_no_auto_ban",
+                },
+            )
+        return True
+
     def record_failed_login_attempt(self, username, password):
         now = utcnow()
         cutoff = now - dt.timedelta(seconds=LOGIN_BRUTEFORCE_WINDOW_SECONDS)
@@ -604,6 +803,101 @@ class AppHandler(BaseHTTPRequestHandler):
                     "recommendation": "review_credentials_no_auto_ban",
                 },
             )
+
+    def detect_sql_injection_probe(self, source, fields):
+        matches = []
+        inspected = {}
+        for field, value in fields.items():
+            if value is None:
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
+            inspected[field] = text[:300]
+            for name, pattern in SQLI_PATTERNS:
+                if pattern.search(text):
+                    matches.append({"field": field, "pattern": name, "value": text[:300]})
+            if field in AUTH_SQLI_FIELDS:
+                for name, pattern in AUTH_SQLI_PATTERNS:
+                    if pattern.search(text):
+                        matches.append({"field": field, "pattern": name, "value": text[:300]})
+
+        if not matches:
+            return False
+
+        self.log_security(
+            "sql_injection_probe",
+            {
+                "source": source,
+                "matches": matches,
+                "fields": inspected,
+            },
+        )
+        self.write_wazuh_alert(
+            "sql_injection_probe",
+            {
+                "severity": "medium",
+                "action": "review",
+                "owner_action": "soc_review",
+                "srcip": self.client_address[0],
+                "method": self.command,
+                "url": self.path,
+                "source": source,
+                "matched_patterns": sorted({match["pattern"] for match in matches}),
+                "matches": matches,
+                "fields": inspected,
+                "recommendation": "review_sql_injection_probe_no_auto_ban",
+            },
+        )
+        return True
+
+    def detect_idor_probe(self, route):
+        target = ""
+        for pattern in IDOR_ROUTE_PATTERNS:
+            match = pattern.match(route)
+            if match:
+                target = unquote(match.group(1))
+                break
+        if not target:
+            return False
+
+        auth_user = None
+        token = self.cookie_value(JWT_COOKIE_NAME)
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+        if token:
+            try:
+                payload = self.verify_jwt(token)
+                with connect_db() as db:
+                    row = db.execute("SELECT id, username, role FROM users WHERE id = ?", (payload.get("sub"),)).fetchone()
+                if row:
+                    auth_user = {"id": row["id"], "username": row["username"], "role": row["role"]}
+            except ApiError:
+                auth_user = None
+
+        self.log_security(
+            "idor_probe_detected",
+            {
+                "target": target,
+                "route": route,
+                "authUser": auth_user,
+            },
+        )
+        self.write_wazuh_alert(
+            "idor_probe_detected",
+            {
+                "severity": "medium",
+                "action": "review",
+                "owner_action": "soc_review",
+                "srcip": self.client_address[0],
+                "method": self.command,
+                "url": self.path,
+                "target_object": target,
+                "auth_user_id": auth_user["id"] if auth_user else "",
+                "auth_username": auth_user["username"] if auth_user else "",
+                "recommendation": "review_idor_probe_no_auto_ban",
+            },
+        )
+        raise ApiError("Resource not found.", 404)
 
     def cookie_value(self, name):
         cookies = self.headers.get("Cookie", "")
@@ -916,6 +1210,8 @@ class AppHandler(BaseHTTPRequestHandler):
             elif self.command == "POST" and route == "/api/return":
                 self.api_return()
             else:
+                if self.detect_idor_probe(route):
+                    return
                 self.send_json(404, {"error": "API route not found."})
         except RedirectHome:
             self.redirect_home()
@@ -925,11 +1221,15 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": f"Server error: {error}"})
 
     def api_books(self):
+        query = parse_qs(urlparse(self.path).query)
+        if query:
+            self.detect_sql_injection_probe("book_search_query", query)
         with connect_db() as db:
             rows = db.execute("SELECT * FROM books ORDER BY title").fetchall()
         self.send_json(200, {"books": [row_to_book(row) for row in rows]})
 
     def api_book(self, book_id):
+        self.detect_sql_injection_probe("book_id", {"book_id": book_id})
         with connect_db() as db:
             row = db.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
         if not row:
@@ -938,6 +1238,14 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def api_register(self):
         body = self.read_json()
+        self.detect_sql_injection_probe(
+            "register",
+            {
+                "username": body.get("username", ""),
+                "fullName": body.get("fullName", ""),
+                "password": body.get("password", ""),
+            },
+        )
         username = str(body.get("username", "")).strip().lower()
         full_name = str(body.get("fullName", "")).strip().replace("<", "").replace(">", "")[:80]
         password = str(body.get("password", ""))
@@ -975,6 +1283,13 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def api_login(self):
         body = self.read_json()
+        self.detect_sql_injection_probe(
+            "login",
+            {
+                "username": body.get("username", ""),
+                "password": body.get("password", ""),
+            },
+        )
         username = str(body.get("username", "")).strip().lower()
         password = str(body.get("password", ""))
         with connect_db() as db:
@@ -1218,6 +1533,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def api_borrow(self):
         user, _payload = self.require_user()
         body = self.read_json()
+        self.detect_sql_injection_probe("borrow", {"bookId": body.get("bookId", "")})
         book_id = str(body.get("bookId", ""))
 
         with connect_db() as db:
@@ -1267,6 +1583,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def api_return(self):
         user, _payload = self.require_user()
         body = self.read_json()
+        self.detect_sql_injection_probe("return", {"loanId": body.get("loanId", "")})
         loan_id = str(body.get("loanId", ""))
 
         with connect_db() as db:
@@ -1278,6 +1595,40 @@ class AppHandler(BaseHTTPRequestHandler):
                 (loan_id, user["id"]),
             ).fetchone()
             if not loan:
+                other_loan = db.execute(
+                    """
+                    SELECT id, user_id, book_id FROM loans
+                    WHERE id = ? AND status = 'borrowed'
+                    """,
+                    (loan_id,),
+                ).fetchone()
+                if other_loan:
+                    self.log_security(
+                        "idor_probe_detected",
+                        {
+                            "target": loan_id,
+                            "route": "/api/return",
+                            "authUser": {"id": user["id"], "username": user["username"]},
+                            "ownerUserId": other_loan["user_id"],
+                        },
+                    )
+                    self.write_wazuh_alert(
+                        "idor_probe_detected",
+                        {
+                            "severity": "medium",
+                            "action": "review",
+                            "owner_action": "soc_review",
+                            "srcip": self.client_address[0],
+                            "method": self.command,
+                            "url": self.path,
+                            "target_object": loan_id,
+                            "target_type": "loan",
+                            "auth_user_id": user["id"],
+                            "auth_username": user["username"],
+                            "owner_user_id": other_loan["user_id"],
+                            "recommendation": "review_idor_probe_no_auto_ban",
+                        },
+                    )
                 raise ApiError("Borrowed book not found.", 404)
 
             fine = fine_for_due_date(loan["due_at"])
@@ -1430,6 +1781,7 @@ class HoneypotHandler(AppHandler):
         super().serve_static()
 
     def do_POST(self):
+        self.inspect_request()
         self.send_json(404, {"error": "Honeypot route not found."})
 
     def handle_api(self):
