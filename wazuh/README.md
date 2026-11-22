@@ -26,7 +26,7 @@ Rule and event mapping:
 ```text
 Rule ID  Event type                    Response       Meaning
 100500   honeypot_file_download        auto-ban       Forged-admin attacker downloaded bait CSV
-100501   login_bruteforce_detected     review only    5 failed login attempts in 60 seconds
+100501   login_bruteforce_detected     review only    10 failed login attempts in 60 seconds
 100502   webadmin_decoy_login          review only    webadmin/webadmin decoy login used
 100503   webadmin_file_download        review only    webadmin decoy account downloaded bait CSV
 100504   idor_probe_detected           review only    possible IDOR probe
